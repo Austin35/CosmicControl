@@ -1,20 +1,25 @@
 ;; Space Colony Resource Management System
-;; Basic version with core oxygen management functionality
 
 ;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
 (define-constant ERR-INVALID-RESOURCE (err u2))
 (define-constant ERR-RESOURCE-UNAVAILABLE (err u3))
-(define-constant ERR-INVALID-CAPACITY (err u4))
+(define-constant ERR-INVALID-PARAMS (err u4))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u5))
-(define-constant ERR-INVALID-MODULE (err u6))
-(define-constant ERR-INVALID-COLONIST (err u7))
+(define-constant ERR-SENSOR-NOT-FOUND (err u6))
+(define-constant ERR-INVALID-CAPACITY (err u7))
+(define-constant ERR-INVALID-RATE (err u8))
+(define-constant ERR-INVALID-MODULE (err u9))
+(define-constant ERR-INVALID-COLONIST (err u10))
+(define-constant ERR-INVALID-SENSOR (err u11))
 
 ;; Resource Types
 (define-constant RESOURCE-TYPE-OXYGEN u1)
+(define-constant RESOURCE-TYPE-WATER u2)
 
 ;; Configuration Constants
 (define-constant MAX-CAPACITY u1000000)
+(define-constant MAX-RATE u1000000000)
 
 ;; Data Variables
 (define-data-var commander principal tx-sender)
@@ -44,6 +49,28 @@
     }
 )
 
+(define-map water-recyclers
+    uint
+    {
+        recycler-id: uint,
+        purity-level: uint,
+        last-maintenance: uint,
+        needs-service: bool
+    }
+)
+
+(define-map environmental-sensors
+    principal
+    {
+        sensor-id: (string-utf8 32),
+        sensor-type: uint,
+        module-id: uint,
+        operational: bool,
+        last-reading: uint,
+        authorized: bool
+    }
+)
+
 ;; Validation Functions
 (define-private (validate-module (module (string-utf8 64)))
     (> (len module) u0))
@@ -51,15 +78,27 @@
 (define-private (validate-capacity (capacity uint))
     (and (> capacity u0) (<= capacity MAX-CAPACITY)))
 
+(define-private (validate-rate (rate uint))
+    (and (> rate u0) (<= rate MAX-RATE)))
+
 (define-private (validate-colonist-id (colonist-id (string-utf8 32)))
     (> (len colonist-id) u0))
+
+(define-private (validate-sensor-id (sensor-id (string-utf8 32)))
+    (> (len sensor-id) u0))
 
 ;; Authorization
 (define-private (is-commander)
     (is-eq tx-sender (var-get commander)))
 
-;; Core Functions
+(define-private (is-authorized-sensor)
+    (match (map-get? environmental-sensors tx-sender)
+        sensor (get authorized sensor)
+        false))
+
+;; Resource Management Functions
 (define-public (register-module 
+    (resource-type uint)
     (module (string-utf8 64))
     (capacity uint)
     (rate uint))
@@ -67,11 +106,16 @@
         (asserts! (is-commander) ERR-NOT-AUTHORIZED)
         (asserts! (validate-module module) ERR-INVALID-MODULE)
         (asserts! (validate-capacity capacity) ERR-INVALID-CAPACITY)
+        (asserts! (validate-rate rate) ERR-INVALID-RATE)
+        (asserts! (or 
+            (is-eq resource-type RESOURCE-TYPE-OXYGEN)
+            (is-eq resource-type RESOURCE-TYPE-WATER))
+            ERR-INVALID-RESOURCE)
         
         (let ((module-id (var-get module-count)))
             (map-set modules module-id
                 {
-                    resource-type: RESOURCE-TYPE-OXYGEN,
+                    resource-type: resource-type,
                     module: module,
                     capacity: capacity,
                     available: capacity,
@@ -81,6 +125,7 @@
             (var-set module-count (+ module-id u1))
             (ok module-id))))
 
+;; Oxygen Management
 (define-public (reserve-oxygen 
     (module-id uint)
     (colonist-id (string-utf8 32))
@@ -108,10 +153,68 @@
         
         (ok true)))
 
+;; Water Management
+(define-public (update-water-quality
+    (module-id uint)
+    (purity-level uint))
+    (begin
+        (asserts! (is-authorized-sensor) ERR-NOT-AUTHORIZED)
+        (asserts! (<= purity-level u100) ERR-INVALID-PARAMS)
+        (asserts! (is-some (map-get? modules module-id)) ERR-INVALID-RESOURCE)
+        
+        (match (map-get? water-recyclers module-id)
+            recycler (begin
+                (map-set water-recyclers module-id
+                    (merge recycler {
+                        purity-level: purity-level,
+                        needs-service: (< purity-level u80),
+                        last-maintenance: block-height
+                    }))
+                (ok true))
+            ERR-INVALID-RESOURCE)))
+
+;; Sensor Management
+(define-public (register-sensor
+    (sensor-id (string-utf8 32))
+    (sensor-type uint)
+    (module-id uint))
+    (begin
+        (asserts! (is-commander) ERR-NOT-AUTHORIZED)
+        (asserts! (validate-sensor-id sensor-id) ERR-INVALID-SENSOR)
+        (asserts! (is-some (map-get? modules module-id)) ERR-INVALID-RESOURCE)
+        (asserts! (or 
+            (is-eq sensor-type RESOURCE-TYPE-OXYGEN)
+            (is-eq sensor-type RESOURCE-TYPE-WATER))
+            ERR-INVALID-RESOURCE)
+        
+        (map-set environmental-sensors tx-sender
+            {
+                sensor-id: sensor-id,
+                sensor-type: sensor-type,
+                module-id: module-id,
+                operational: true,
+                last-reading: block-height,
+                authorized: true
+            })
+        (ok true)))
+
+(define-public (update-sensor-reading)
+    (match (map-get? environmental-sensors tx-sender)
+        sensor (begin
+            (map-set environmental-sensors tx-sender
+                (merge sensor {last-reading: block-height}))
+            (ok true))
+        ERR-SENSOR-NOT-FOUND))
+
 ;; Read-only functions
 (define-read-only (get-module-details (module-id uint))
     (map-get? modules module-id))
 
 (define-read-only (get-oxygen-status (module-id uint))
     (map-get? oxygen-chambers module-id))
-    
+
+(define-read-only (get-water-recycler-status (module-id uint))
+    (map-get? water-recyclers module-id))
+
+(define-read-only (get-sensor-status (sensor-principal principal))
+    (map-get? environmental-sensors sensor-principal))
