@@ -16,6 +16,7 @@
 ;; Resource Types
 (define-constant RESOURCE-TYPE-OXYGEN u1)
 (define-constant RESOURCE-TYPE-WATER u2)
+(define-constant RESOURCE-TYPE-POWER u3)
 
 ;; Configuration Constants
 (define-constant MAX-CAPACITY u1000000)
@@ -24,7 +25,8 @@
 ;; Data Variables
 (define-data-var commander principal tx-sender)
 (define-data-var module-count uint u0)
-(define-data-var min-oxygen-rate uint u1000)
+(define-data-var min-oxygen-rate uint u1000) ;; in microSTX
+(define-data-var power-rate uint u100) ;; cost per kWh in microSTX
 
 ;; Maps
 (define-map modules
@@ -56,6 +58,15 @@
         purity-level: uint,
         last-maintenance: uint,
         needs-service: bool
+    }
+)
+
+(define-map power-allocation
+    {module-id: uint, user: principal}
+    {
+        allocated: uint,
+        consumed: uint,
+        last-update: uint
     }
 )
 
@@ -109,7 +120,8 @@
         (asserts! (validate-rate rate) ERR-INVALID-RATE)
         (asserts! (or 
             (is-eq resource-type RESOURCE-TYPE-OXYGEN)
-            (is-eq resource-type RESOURCE-TYPE-WATER))
+            (is-eq resource-type RESOURCE-TYPE-WATER)
+            (is-eq resource-type RESOURCE-TYPE-POWER))
             ERR-INVALID-RESOURCE)
         
         (let ((module-id (var-get module-count)))
@@ -138,8 +150,10 @@
         (asserts! (>= (get available module) u1) ERR-RESOURCE-UNAVAILABLE)
         (asserts! (>= oxygen-fee (var-get min-oxygen-rate)) ERR-INSUFFICIENT-PAYMENT)
         
+        ;; Process payment
         (try! (stx-transfer? oxygen-fee tx-sender (var-get commander)))
         
+        ;; Update oxygen chamber
         (map-set oxygen-chambers module-id
             {
                 chamber-id: module-id,
@@ -148,6 +162,7 @@
                 cycle-end: (+ block-height duration)
             })
         
+        ;; Update module availability
         (map-set modules module-id
             (merge module {available: (- (get available module) u1)}))
         
@@ -173,7 +188,35 @@
                 (ok true))
             ERR-INVALID-RESOURCE)))
 
-;; Sensor Management
+;; Power Management
+(define-public (allocate-power
+    (module-id uint)
+    (amount uint))
+    (let (
+        (module (unwrap! (map-get? modules module-id) ERR-INVALID-RESOURCE))
+        (power-cost (* amount (var-get power-rate)))
+        )
+        (asserts! (validate-capacity amount) ERR-INVALID-CAPACITY)
+        (asserts! (>= (get available module) amount) ERR-RESOURCE-UNAVAILABLE)
+        
+        ;; Process payment
+        (try! (stx-transfer? power-cost tx-sender (var-get commander)))
+        
+        ;; Update power allocation
+        (map-set power-allocation
+            {module-id: module-id, user: tx-sender}
+            {
+                allocated: amount,
+                consumed: u0,
+                last-update: block-height
+            })
+        
+        (map-set modules module-id
+            (merge module {available: (- (get available module) amount)}))
+        
+        (ok true)))
+
+;; Environmental Sensor Management
 (define-public (register-sensor
     (sensor-id (string-utf8 32))
     (sensor-type uint)
@@ -184,7 +227,8 @@
         (asserts! (is-some (map-get? modules module-id)) ERR-INVALID-RESOURCE)
         (asserts! (or 
             (is-eq sensor-type RESOURCE-TYPE-OXYGEN)
-            (is-eq sensor-type RESOURCE-TYPE-WATER))
+            (is-eq sensor-type RESOURCE-TYPE-WATER)
+            (is-eq sensor-type RESOURCE-TYPE-POWER))
             ERR-INVALID-RESOURCE)
         
         (map-set environmental-sensors tx-sender
@@ -197,6 +241,18 @@
                 authorized: true
             })
         (ok true)))
+
+(define-public (deactivate-sensor (sensor-principal principal))
+    (begin
+        (asserts! (is-commander) ERR-NOT-AUTHORIZED)
+        (asserts! (is-some (map-get? environmental-sensors sensor-principal)) ERR-SENSOR-NOT-FOUND)
+        
+        (match (map-get? environmental-sensors sensor-principal)
+            sensor (begin
+                (map-set environmental-sensors sensor-principal
+                    (merge sensor {operational: false, authorized: false}))
+                (ok true))
+            ERR-SENSOR-NOT-FOUND)))
 
 (define-public (update-sensor-reading)
     (match (map-get? environmental-sensors tx-sender)
@@ -215,6 +271,9 @@
 
 (define-read-only (get-water-recycler-status (module-id uint))
     (map-get? water-recyclers module-id))
+
+(define-read-only (get-power-usage (module-id uint) (user principal))
+    (map-get? power-allocation {module-id: module-id, user: user}))
 
 (define-read-only (get-sensor-status (sensor-principal principal))
     (map-get? environmental-sensors sensor-principal))
